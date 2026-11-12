@@ -23,7 +23,6 @@ async function fetchCanvas(endpoint) {
 async function fetchNotion(endpoint, method = "GET", body = null) {
   const url = "https:" + "//" + "api." + "notion." + "com/v1" + endpoint;
   while (true) {
-    // Gentle 350ms pacing (~3 req/sec) to stay well under Notion's rate limit
     await sleep(350);
     const res = await fetch(url, {
       method,
@@ -50,7 +49,7 @@ async function fetchNotion(endpoint, method = "GET", body = null) {
   }
 }
 
-// Pre-load all existing Notion assignments once so we don't query per item
+// Pre-load existing Notion assignments + their current values for smart diffing
 async function loadExistingAssignments() {
   const map = new Map();
   let cursor = undefined;
@@ -60,8 +59,19 @@ async function loadExistingAssignments() {
       ...(cursor && { start_cursor: cursor }),
     });
     for (const page of res.results) {
-      const canvasId = page.properties["Canvas ID"]?.number;
-      if (canvasId) map.set(canvasId, page.id);
+      const p = page.properties;
+      const canvasId = p["Canvas ID"]?.number;
+      if (canvasId) {
+        map.set(canvasId, {
+          id: page.id,
+          name: p.Name?.title?.at(0)?.plain_text || "",
+          dueDate: p["Due Date"]?.date?.start || null,
+          points: p.Points?.number ?? 0,
+          score: p.Score?.number ?? null,
+          status: p.Status?.status?.name || "Not started",
+          courseId: p.Course?.relation?.at(0)?.id || null,
+        });
+      }
     }
     cursor = res.has_more ? res.next_cursor : undefined;
   } while (cursor);
@@ -106,12 +116,16 @@ async function syncCanvasWithGrades() {
         "/courses/" + courseId + "/enrollments?user_id=self"
       );
       const currentScore = enrollments.at(0)?.grades?.current_score;
+      const existingGrade = notionClassPage.properties["Current Grade"]?.number;
       if (currentScore !== undefined && currentScore !== null) {
-        await fetchNotion("/pages/" + notionClassPage.id, "PATCH", {
-          properties: {
-            "Current Grade": { number: currentScore / 100 },
-          },
-        });
+        const normalized = Math.round(currentScore * 100) / 10000;
+        if (existingGrade !== normalized) {
+          await fetchNotion("/pages/" + notionClassPage.id, "PATCH", {
+            properties: {
+              "Current Grade": { number: normalized },
+            },
+          });
+        }
       }
     } catch {
       // Skips cleanly if Current Grade column isn't present or score isn't available
@@ -121,17 +135,34 @@ async function syncCanvasWithGrades() {
       "/courses/" + courseId + "/assignments?include[]=submission&per_page=100"
     );
 
+    let updatedCount = 0;
+
     for (const item of assignments) {
       const submission = item.submission;
-      const isSubmitted =
+      const isSubmittedOnCanvas =
         submission?.workflow_state === "submitted" ||
         submission?.workflow_state === "graded";
+
+      const newPoints = item.points_possible || 0;
+      const newScore =
+        submission?.score !== null && submission?.score !== undefined
+          ? submission.score
+          : null;
+      const newDueDate = item.due_at || null;
+
+      const existing = existingMap.get(item.id);
+
+      // Protect manual Notion status: only auto-promote to "Done" if Canvas shows submitted/graded
+      let targetStatus = existing ? existing.status : "Not started";
+      if (isSubmittedOnCanvas) {
+        targetStatus = "Done";
+      }
 
       const properties = {
         Name: { title: [{ text: { content: item.name } }] },
         Course: { relation: [{ id: notionClassPage.id }] },
         "Canvas ID": { number: item.id },
-        Points: { number: item.points_possible || 0 },
+        Points: { number: newPoints },
         URL: { url: item.html_url },
         Type: {
           select: {
@@ -143,29 +174,52 @@ async function syncCanvasWithGrades() {
           },
         },
         Status: {
-          status: { name: isSubmitted ? "Done" : "Not started" },
+          status: { name: targetStatus },
         },
-        ...(item.due_at && {
-          "Due Date": { date: { start: item.due_at } },
+        ...(newDueDate && {
+          "Due Date": { date: { start: newDueDate } },
         }),
-        ...(submission?.score !== null &&
-          submission?.score !== undefined && {
-            Score: { number: submission.score },
-          }),
+        ...(newScore !== null && {
+          Score: { number: newScore },
+        }),
       };
 
-      const existingPageId = existingMap.get(item.id);
-      if (existingPageId) {
-        await fetchNotion("/pages/" + existingPageId, "PATCH", { properties });
+      if (existing) {
+        // Smart diff: skip API update if nothing actually changed!
+        const sameDue =
+          (existing.dueDate || "").slice(0, 16) === (newDueDate || "").slice(0, 16);
+        const isUnchanged =
+          existing.name === item.name &&
+          existing.courseId === notionClassPage.id &&
+          existing.points === newPoints &&
+          existing.score === newScore &&
+          existing.status === targetStatus &&
+          sameDue;
+
+        if (isUnchanged) continue;
+
+        await fetchNotion("/pages/" + existing.id, "PATCH", { properties });
+        updatedCount++;
       } else {
         const created = await fetchNotion("/pages", "POST", {
           parent: { database_id: ASSIGNMENTS_DB_ID },
           properties,
         });
-        existingMap.set(item.id, created.id);
+        existingMap.set(item.id, {
+          id: created.id,
+          name: item.name,
+          dueDate: newDueDate,
+          points: newPoints,
+          score: newScore,
+          status: targetStatus,
+          courseId: notionClassPage.id,
+        });
+        updatedCount++;
       }
     }
-    console.log("✅ Synced " + assignments.length + " assignments for: " + course.name);
+    console.log(
+      "✅ " + course.name + ": " + updatedCount + " created/updated (" + (assignments.length - updatedCount) + " unchanged)"
+    );
   }
   console.log("🎉 Sync complete!");
 }
